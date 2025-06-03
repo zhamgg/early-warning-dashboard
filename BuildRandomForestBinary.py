@@ -62,9 +62,26 @@ except KeyError:
     print(f"Available columns: {df.columns.tolist()}")
     exit(1)
 
+# Remove columns that would cause data leakage
+# These columns directly relate to the target variable calculation
+leak_columns = [
+    "Cash Outflows",
+    "Cash Inflows",
+    "Net Cash Flows",
+    "Net Market & Other",
+    "Net Change AUM",
+    "Ending Net Assets"
+]
+columns_to_remove = ['target'] + leak_columns
+available_columns_to_remove = [col for col in columns_to_remove if col in df.columns]
+print(f"Removing columns to prevent data leakage: {available_columns_to_remove}")
+
 # Separate features and target
-X = df.drop('target', axis=1)
+X = df.drop(columns=available_columns_to_remove, axis=1)
 y = df['target']
+
+print(f"Final feature set has {X.shape[1]} columns")
+print(f"Remaining columns: {X.columns.tolist()}")
 
 # Identify categorical and numerical columns
 categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
