@@ -88,6 +88,272 @@ if 'sequential_models_trained' not in st.session_state:
 if 'df' not in st.session_state:
     st.session_state.df = None
 
+# Auto-training functions
+@st.cache_resource
+def train_binary_model(df):
+    """Train binary classification model if not found"""
+    try:
+        # Create target variable
+        df_model = df.copy()
+        df_model['target'] = (df_model['Net Cash Flows'] < -1000000).astype(int)
+        
+        # Remove target leakage columns
+        leak_columns = [
+            "Cash Outflows", "Cash Inflows", "Net Cash Flows",
+            "Net Market & Other", "Net Change AUM", "Ending Net Assets"
+        ]
+        columns_to_remove = ['target'] + leak_columns
+        available_columns_to_remove = [col for col in columns_to_remove if col in df_model.columns]
+        
+        # Prepare features and target
+        X = df_model.drop(columns=available_columns_to_remove, axis=1)
+        y = df_model['target']
+        
+        # Identify column types
+        categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+        numerical_cols = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
+        
+        # Create preprocessing pipeline
+        preprocessor = ColumnTransformer(transformers=[
+            ('num', Pipeline([
+                ('imputer', SimpleImputer(strategy='median')),
+                ('scaler', StandardScaler())
+            ]), numerical_cols),
+            ('cat', Pipeline([
+                ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+                ('onehot', OneHotEncoder(handle_unknown='ignore'))
+            ]), categorical_cols)
+        ])
+        
+        # Train-test split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        # Train model
+        model_pipeline = Pipeline([
+            ('preprocessor', preprocessor),
+            ('classifier', RandomForestClassifier(
+                n_estimators=100, 
+                random_state=42,
+                class_weight='balanced'
+            ))
+        ])
+        
+        model_pipeline.fit(X_train, y_train)
+        
+        # Save model
+        joblib.dump(model_pipeline, 'EarlyWarningWeights.joblib')
+        
+        return model_pipeline, "Binary model trained successfully!"
+        
+    except Exception as e:
+        return None, f"Error training binary model: {e}"
+
+@st.cache_resource
+def train_sequential_models(df):
+    """Train sequential classification models if not found"""
+    try:
+        # Compute percentage change in AUM
+        df_seq = df.copy()
+        df_seq["Pct Change in AUM"] = (df_seq["Net Cash Flows"] / df_seq["Beginning Net Assets"]) * 100.0
+        df_seq = df_seq.replace([np.inf, -np.inf], np.nan)
+        df_seq = df_seq.dropna(subset=["Pct Change in AUM", "Beginning Net Assets"]).reset_index(drop=True)
+        
+        # Cap extreme outliers
+        pct_99 = df_seq["Pct Change in AUM"].quantile(0.99)
+        pct_1 = df_seq["Pct Change in AUM"].quantile(0.01)
+        df_seq["Pct Change in AUM_capped"] = df_seq["Pct Change in AUM"].clip(lower=pct_1, upper=pct_99)
+        
+        # Create sequential targets
+        df_seq['stage1_target'] = (df_seq["Pct Change in AUM_capped"] >= 0).astype(int)
+        
+        # Stage 2a: For outflows only
+        outflow_mask = df_seq["Pct Change in AUM_capped"] < 0
+        df_seq['stage2a_target'] = np.nan
+        df_seq.loc[outflow_mask, 'stage2a_target'] = (df_seq.loc[outflow_mask, "Pct Change in AUM_capped"] >= -10).astype(int)
+        
+        # Stage 2b: For inflows only
+        inflow_mask = df_seq["Pct Change in AUM_capped"] >= 0
+        df_seq['stage2b_target'] = np.nan
+        df_seq.loc[inflow_mask, 'stage2b_target'] = (df_seq.loc[inflow_mask, "Pct Change in AUM_capped"] < 10).astype(int)
+        
+        # Prepare features
+        leak_cols = [
+            "Cash Outflows", "Cash Inflows", "Net Cash Flows",
+            "Net Market & Other", "Net Change AUM", "Ending Net Assets",
+            "Pct Change in AUM", "Pct Change in AUM_capped", 
+            "stage1_target", "stage2a_target", "stage2b_target"
+        ]
+        
+        feature_cols = [c for c in df_seq.columns if c not in leak_cols]
+        X = df_seq[feature_cols].copy()
+        
+        # Identify column types
+        categorical_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
+        numeric_cols = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
+        
+        # Create preprocessing pipeline
+        cat_transformer = Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
+            ("ord_enc", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1))
+        ])
+        
+        num_transformer = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler())
+        ])
+        
+        preprocessor = ColumnTransformer([
+            ("num", num_transformer, numeric_cols),
+            ("cat", cat_transformer, categorical_cols)
+        ])
+        
+        # Create models directory
+        os.makedirs("sequential_models", exist_ok=True)
+        
+        # Train Stage 1 Model
+        y_stage1 = df_seq['stage1_target']
+        X_train_s1, X_test_s1, y_train_s1, y_test_s1 = train_test_split(
+            X, y_stage1, test_size=0.2, random_state=42, stratify=y_stage1
+        )
+        
+        stage1_pipeline = ImbPipeline([
+            ('preprocessor', preprocessor),
+            ('smote', SMOTE(random_state=42, k_neighbors=3)),
+            ('classifier', RandomForestClassifier(
+                n_estimators=300,
+                random_state=42,
+                class_weight="balanced"
+            ))
+        ])
+        
+        stage1_pipeline.fit(X_train_s1, y_train_s1)
+        joblib.dump(stage1_pipeline, "sequential_models/stage1_inflow_outflow.joblib")
+        
+        # Train Stage 2a Model (Outflows)
+        stage2a_pipeline = None
+        outflow_data = df_seq[df_seq['stage1_target'] == 0].copy()
+        if len(outflow_data) > 20:
+            X_outflows = X.loc[outflow_data.index]
+            y_stage2a = outflow_data['stage2a_target'].dropna()
+            X_outflows = X_outflows.loc[y_stage2a.index]
+            
+            if len(X_outflows) > 10:
+                X_train_s2a, X_test_s2a, y_train_s2a, y_test_s2a = train_test_split(
+                    X_outflows, y_stage2a, test_size=0.2, random_state=42, stratify=y_stage2a
+                )
+                
+                stage2a_pipeline = ImbPipeline([
+                    ('preprocessor', preprocessor),
+                    ('smote', SMOTE(random_state=42, k_neighbors=3)),
+                    ('classifier', RandomForestClassifier(
+                        n_estimators=300,
+                        random_state=42,
+                        class_weight="balanced"
+                    ))
+                ])
+                
+                stage2a_pipeline.fit(X_train_s2a, y_train_s2a)
+                joblib.dump(stage2a_pipeline, "sequential_models/stage2a_minor_major_outflow.joblib")
+        
+        # Train Stage 2b Model (Inflows)
+        stage2b_pipeline = None
+        inflow_data = df_seq[df_seq['stage1_target'] == 1].copy()
+        if len(inflow_data) > 20:
+            X_inflows = X.loc[inflow_data.index]
+            y_stage2b = inflow_data['stage2b_target'].dropna()
+            X_inflows = X_inflows.loc[y_stage2b.index]
+            
+            if len(X_inflows) > 10:
+                X_train_s2b, X_test_s2b, y_train_s2b, y_test_s2b = train_test_split(
+                    X_inflows, y_stage2b, test_size=0.2, random_state=42, stratify=y_stage2b
+                )
+                
+                stage2b_pipeline = ImbPipeline([
+                    ('preprocessor', preprocessor),
+                    ('smote', SMOTE(random_state=42, k_neighbors=3)),
+                    ('classifier', RandomForestClassifier(
+                        n_estimators=300,
+                        random_state=42,
+                        class_weight="balanced"
+                    ))
+                ])
+                
+                stage2b_pipeline.fit(X_train_s2b, y_train_s2b)
+                joblib.dump(stage2b_pipeline, "sequential_models/stage2b_minor_major_inflow.joblib")
+        
+        return stage1_pipeline, stage2a_pipeline, stage2b_pipeline, "Sequential models trained successfully!"
+        
+    except Exception as e:
+        return None, None, None, f"Error training sequential models: {e}"
+
+def check_and_load_models(df=None):
+    """Check if models exist, train if not, then load them"""
+    binary_model = None
+    stage1_model = None
+    stage2a_model = None
+    stage2b_model = None
+    messages = []
+    
+    # Check and handle binary model
+    if os.path.exists('EarlyWarningWeights.joblib'):
+        try:
+            binary_model = joblib.load('EarlyWarningWeights.joblib')
+            messages.append("✅ Binary model loaded from file")
+        except Exception as e:
+            messages.append(f"❌ Error loading binary model: {e}")
+    else:
+        if df is not None and 'Net Cash Flows' in df.columns:
+            with st.spinner("Training binary model (this may take a few minutes)..."):
+                binary_model, msg = train_binary_model(df)
+                messages.append(f"🔄 {msg}")
+        else:
+            messages.append("⚠️ Binary model not found and cannot train without data")
+    
+    # Check and handle sequential models
+    stage1_exists = os.path.exists('sequential_models/stage1_inflow_outflow.joblib')
+    stage2a_exists = os.path.exists('sequential_models/stage2a_minor_major_outflow.joblib')
+    stage2b_exists = os.path.exists('sequential_models/stage2b_minor_major_inflow.joblib')
+    
+    if stage1_exists:
+        try:
+            stage1_model = joblib.load('sequential_models/stage1_inflow_outflow.joblib')
+            messages.append("✅ Stage 1 model loaded from file")
+        except Exception as e:
+            messages.append(f"❌ Error loading stage 1 model: {e}")
+    
+    if stage2a_exists:
+        try:
+            stage2a_model = joblib.load('sequential_models/stage2a_minor_major_outflow.joblib')
+            messages.append("✅ Stage 2a model loaded from file")
+        except Exception as e:
+            messages.append(f"❌ Error loading stage 2a model: {e}")
+    
+    if stage2b_exists:
+        try:
+            stage2b_model = joblib.load('sequential_models/stage2b_minor_major_inflow.joblib')
+            messages.append("✅ Stage 2b model loaded from file")
+        except Exception as e:
+            messages.append(f"❌ Error loading stage 2b model: {e}")
+    
+    # Train sequential models if any are missing and we have data
+    if not (stage1_exists and stage2a_exists and stage2b_exists):
+        if df is not None and 'Net Cash Flows' in df.columns and 'Beginning Net Assets' in df.columns:
+            with st.spinner("Training sequential models (this may take several minutes)..."):
+                s1, s2a, s2b, msg = train_sequential_models(df)
+                if s1 is not None:
+                    stage1_model = s1
+                if s2a is not None:
+                    stage2a_model = s2a
+                if s2b is not None:
+                    stage2b_model = s2b
+                messages.append(f"🔄 {msg}")
+        else:
+            messages.append("⚠️ Sequential models not found and cannot train without data")
+    
+    return binary_model, stage1_model, stage2a_model, stage2b_model, messages
+
 # Main title
 st.markdown('<h1 class="main-header">🚨 Fund Outflow Early Warning System</h1>', unsafe_allow_html=True)
 
@@ -229,10 +495,80 @@ if uploaded_file is not None or os.path.exists("joined_fund_data2.xlsx"):
                 st.session_state.df = df
                 st.session_state.data_loaded = True
                 st.sidebar.success(f"✅ Data loaded successfully! Shape: {df.shape}")
+                
+                # Check and load/train models automatically
+                st.sidebar.markdown("---")
+                st.sidebar.subheader("🤖 Model Status")
+                with st.sidebar:
+                    binary_model, stage1_model, stage2a_model, stage2b_model, messages = check_and_load_models(df)
+                    
+                    # Store models in session state
+                    st.session_state.binary_model = binary_model
+                    st.session_state.stage1_model = stage1_model
+                    st.session_state.stage2a_model = stage2a_model
+                    st.session_state.stage2b_model = stage2b_model
+                    
+                    # Display model status messages
+                    for message in messages:
+                        if "✅" in message:
+                            st.success(message)
+                        elif "🔄" in message:
+                            st.info(message)
+                        elif "❌" in message:
+                            st.error(message)
+                        elif "⚠️" in message:
+                            st.warning(message)
             else:
                 st.sidebar.error("❌ Failed to load data")
+    else:
+        # Data already loaded, just show model status
+        st.sidebar.success(f"✅ Data loaded! Shape: {st.session_state.df.shape}")
+        
+        # Check if models are already in session state
+        if 'binary_model' not in st.session_state:
+            st.sidebar.markdown("---")
+            st.sidebar.subheader("🤖 Model Status")
+            with st.sidebar:
+                binary_model, stage1_model, stage2a_model, stage2b_model, messages = check_and_load_models(st.session_state.df)
+                
+                # Store models in session state
+                st.session_state.binary_model = binary_model
+                st.session_state.stage1_model = stage1_model
+                st.session_state.stage2a_model = stage2a_model
+                st.session_state.stage2b_model = stage2b_model
+                
+                # Display model status messages
+                for message in messages:
+                    if "✅" in message:
+                        st.success(message)
+                    elif "🔄" in message:
+                        st.info(message)
+                    elif "❌" in message:
+                        st.error(message)
+                    elif "⚠️" in message:
+                        st.warning(message)
+        else:
+            # Models already loaded, just show status
+            st.sidebar.markdown("---")
+            st.sidebar.subheader("🤖 Model Status")
+            
+            if st.session_state.binary_model is not None:
+                st.sidebar.success("✅ Binary model ready")
+            else:
+                st.sidebar.error("❌ Binary model unavailable")
+                
+            if st.session_state.stage1_model is not None:
+                st.sidebar.success("✅ Sequential models ready")
+            else:
+                st.sidebar.error("❌ Sequential models unavailable")
 else:
     st.sidebar.warning("⚠️ Please upload the fund data file")
+    # Initialize empty models in session state
+    if 'binary_model' not in st.session_state:
+        st.session_state.binary_model = None
+        st.session_state.stage1_model = None
+        st.session_state.stage2a_model = None
+        st.session_state.stage2b_model = None
 
 # Page routing
 if page == "Overview":
@@ -444,22 +780,27 @@ if page == "Overview":
     col1, col2 = st.columns(2)
     
     with col1:
-        if os.path.exists('EarlyWarningWeights.joblib'):
+        if 'binary_model' in st.session_state and st.session_state.binary_model is not None:
             st.success("✅ Binary Classification Model Available")
+        elif os.path.exists('EarlyWarningWeights.joblib'):
+            st.info("📁 Binary Model File Found (will load with data)")
         else:
-            st.error("❌ Binary Classification Model Missing")
+            st.warning("⚠️ Binary Model Will Be Trained When Data Is Loaded")
     
     with col2:
-        stage1_exists = os.path.exists('sequential_models/stage1_inflow_outflow.joblib')
-        stage2a_exists = os.path.exists('sequential_models/stage2a_minor_major_outflow.joblib')
-        stage2b_exists = os.path.exists('sequential_models/stage2b_minor_major_inflow.joblib')
-        
-        if stage1_exists and stage2a_exists and stage2b_exists:
+        if 'stage1_model' in st.session_state and st.session_state.stage1_model is not None:
             st.success("✅ Sequential Classification Models Available")
-        elif stage1_exists:
-            st.warning("⚠️ Sequential Models Partially Available")
         else:
-            st.error("❌ Sequential Classification Models Missing")
+            stage1_exists = os.path.exists('sequential_models/stage1_inflow_outflow.joblib')
+            stage2a_exists = os.path.exists('sequential_models/stage2a_minor_major_outflow.joblib')
+            stage2b_exists = os.path.exists('sequential_models/stage2b_minor_major_inflow.joblib')
+            
+            if stage1_exists and stage2a_exists and stage2b_exists:
+                st.info("📁 Sequential Model Files Found (will load with data)")
+            elif stage1_exists:
+                st.warning("⚠️ Sequential Models Partially Available")
+            else:
+                st.warning("⚠️ Sequential Models Will Be Trained When Data Is Loaded")
     
     # Feature importance summary
     st.subheader("🔍 Key Predictive Features")
@@ -626,12 +967,12 @@ elif page == "Fund Risk Assessment":
         )
         
         if model_type == "Binary Classification":
-            if not os.path.exists('EarlyWarningWeights.joblib'):
-                st.warning("⚠️ Binary model not found. Please train the binary model first.")
+            if st.session_state.binary_model is None:
+                st.warning("⚠️ Binary model not available. Please ensure data is loaded to enable automatic training.")
             else:
                 try:
-                    # Load binary model
-                    binary_model = joblib.load('EarlyWarningWeights.joblib')
+                    # Use binary model from session state
+                    binary_model = st.session_state.binary_model
                     
                     # Fund selection
                     st.subheader("Select a Fund for Binary Risk Assessment")
@@ -728,19 +1069,15 @@ elif page == "Fund Risk Assessment":
                     st.error(f"❌ Error with binary model assessment: {e}")
         
         else:  # Sequential Classification
-            # Check if sequential models exist
-            stage1_exists = os.path.exists('sequential_models/stage1_inflow_outflow.joblib')
-            stage2a_exists = os.path.exists('sequential_models/stage2a_minor_major_outflow.joblib')
-            stage2b_exists = os.path.exists('sequential_models/stage2b_minor_major_inflow.joblib')
-            
-            if not stage1_exists:
-                st.warning("⚠️ Sequential models not found. Please train the sequential models first.")
+            # Check if sequential models exist in session state
+            if st.session_state.stage1_model is None:
+                st.warning("⚠️ Sequential models not available. Please ensure data is loaded to enable automatic training.")
             else:
                 try:
-                    # Load sequential models
-                    stage1_model = joblib.load('sequential_models/stage1_inflow_outflow.joblib')
-                    stage2a_model = joblib.load('sequential_models/stage2a_minor_major_outflow.joblib') if stage2a_exists else None
-                    stage2b_model = joblib.load('sequential_models/stage2b_minor_major_inflow.joblib') if stage2b_exists else None
+                    # Use sequential models from session state
+                    stage1_model = st.session_state.stage1_model
+                    stage2a_model = st.session_state.stage2a_model
+                    stage2b_model = st.session_state.stage2b_model
                     
                     # Fund selection
                     st.subheader("Select a Fund for Sequential Risk Assessment")
@@ -926,11 +1263,11 @@ elif page == "Early Warning Dashboard":
         
         if dashboard_model == "Binary Classification":
             # Binary model dashboard
-            if not os.path.exists('EarlyWarningWeights.joblib'):
-                st.warning("⚠️ Binary model not found. Please train the binary model first.")
+            if st.session_state.binary_model is None:
+                st.warning("⚠️ Binary model not available. Please ensure data is loaded to enable automatic training.")
             else:
                 try:
-                    model = joblib.load('EarlyWarningWeights.joblib')
+                    model = st.session_state.binary_model
                     
                     # Prepare features (remove target leakage columns)
                     leak_columns = [
@@ -1100,19 +1437,15 @@ elif page == "Early Warning Dashboard":
                     st.error(f"❌ Error creating binary risk dashboard: {e}")
         
         else:  # Sequential Classification Dashboard
-            # Check if sequential models exist
-            stage1_exists = os.path.exists('sequential_models/stage1_inflow_outflow.joblib')
-            stage2a_exists = os.path.exists('sequential_models/stage2a_minor_major_outflow.joblib')
-            stage2b_exists = os.path.exists('sequential_models/stage2b_minor_major_inflow.joblib')
-            
-            if not stage1_exists:
-                st.warning("⚠️ Sequential models not found. Please train the sequential models first.")
+            # Check if sequential models exist in session state
+            if st.session_state.stage1_model is None:
+                st.warning("⚠️ Sequential models not available. Please ensure data is loaded to enable automatic training.")
             else:
                 try:
-                    # Load sequential models
-                    stage1_model = joblib.load('sequential_models/stage1_inflow_outflow.joblib')
-                    stage2a_model = joblib.load('sequential_models/stage2a_minor_major_outflow.joblib') if stage2a_exists else None
-                    stage2b_model = joblib.load('sequential_models/stage2b_minor_major_inflow.joblib') if stage2b_exists else None
+                    # Use sequential models from session state
+                    stage1_model = st.session_state.stage1_model
+                    stage2a_model = st.session_state.stage2a_model
+                    stage2b_model = st.session_state.stage2b_model
                     
                     # Prepare features
                     leak_columns = [
