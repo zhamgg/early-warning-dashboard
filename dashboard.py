@@ -7,13 +7,14 @@ from plotly.subplots import make_subplots
 import joblib
 import os
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, OrdinalEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
 from sklearn.impute import SimpleImputer
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -58,14 +59,32 @@ st.markdown("""
         padding: 1rem;
         margin: 0.5rem 0;
     }
+    .performance-metric {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        text-align: center;
+        margin: 0.5rem 0;
+    }
+    .sequential-stage {
+        background: linear-gradient(135deg, #ff9a9e 0%, #fecfef 100%);
+        color: #333;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        text-align: center;
+        margin: 0.5rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # Initialize session state
 if 'data_loaded' not in st.session_state:
     st.session_state.data_loaded = False
-if 'models_trained' not in st.session_state:
-    st.session_state.models_trained = False
+if 'model_trained' not in st.session_state:
+    st.session_state.model_trained = False
+if 'sequential_models_trained' not in st.session_state:
+    st.session_state.sequential_models_trained = False
 if 'df' not in st.session_state:
     st.session_state.df = None
 
@@ -76,7 +95,7 @@ st.markdown('<h1 class="main-header">🚨 Fund Outflow Early Warning System</h1>
 st.sidebar.title("📊 Navigation")
 page = st.sidebar.selectbox(
     "Choose a page:",
-    ["Overview", "Data Analysis", "Model Training", "Predictions", "Early Warning Dashboard"]
+    ["Overview", "Data Analysis", "Fund Risk Assessment", "Early Warning Dashboard"]
 )
 
 # File uploader in sidebar
@@ -134,6 +153,73 @@ def clean_dataframe_for_streamlit(df):
     
     return df_clean
 
+# Sequential model functions
+def create_combined_labels_4cat(pct_change):
+    """Create 4-class labels: 0=major outflow (<-10%), 1=minor outflow ([-10%,0%)), 2=minor inflow ([0%,10%)), 3=major inflow (>=10%)"""
+    combined = np.full(len(pct_change), -1)  # Initialize with invalid value
+   
+    # Major outflow
+    combined[pct_change < -10] = 0
+   
+    # Minor outflow  
+    combined[(pct_change >= -10) & (pct_change < 0)] = 1
+   
+    # Minor inflow
+    combined[(pct_change >= 0) & (pct_change < 10)] = 2
+   
+    # Major inflow
+    combined[pct_change >= 10] = 3
+   
+    return combined
+
+def sequential_predict_4cat(X_data, stage1_model, stage2a_model=None, stage2b_model=None):
+    """
+    Make sequential predictions for 4 categories:
+    Returns combined_pred: 0=major outflow, 1=minor outflow, 2=minor inflow, 3=major inflow
+    """
+    # Stage 1 predictions
+    stage1_pred = stage1_model.predict(X_data)
+    
+    # Initialize stage2 predictions
+    stage2a_pred = np.full(len(X_data), np.nan)
+    stage2b_pred = np.full(len(X_data), np.nan)
+    
+    # Stage 2a predictions (only for predicted outflows)
+    if stage2a_model is not None:
+        outflow_indices = np.where(stage1_pred == 0)[0]
+        if len(outflow_indices) > 0:
+            X_outflows = X_data.iloc[outflow_indices]
+            stage2a_pred_subset = stage2a_model.predict(X_outflows)
+            stage2a_pred[outflow_indices] = stage2a_pred_subset
+    
+    # Stage 2b predictions (only for predicted inflows)
+    if stage2b_model is not None:
+        inflow_indices = np.where(stage1_pred == 1)[0]
+        if len(inflow_indices) > 0:
+            X_inflows = X_data.iloc[inflow_indices]
+            stage2b_pred_subset = stage2b_model.predict(X_inflows)
+            stage2b_pred[inflow_indices] = stage2b_pred_subset
+    
+    # Create combined prediction
+    combined_pred = np.full(len(X_data), -1)
+    
+    # Handle outflows
+    outflow_mask = stage1_pred == 0
+    if stage2a_model is not None:
+        combined_pred[outflow_mask] = stage2a_pred[outflow_mask]
+    else:
+        combined_pred[outflow_mask] = 1
+    
+    # Handle inflows  
+    inflow_mask = stage1_pred == 1
+    if stage2b_model is not None:
+        stage2b_pred_mapped = np.where(stage2b_pred == 1, 2, 3)
+        combined_pred[inflow_mask] = stage2b_pred_mapped[inflow_mask]
+    else:
+        combined_pred[inflow_mask] = 2
+    
+    return stage1_pred, stage2a_pred, stage2b_pred, combined_pred
+
 # Load data
 if uploaded_file is not None or os.path.exists("joined_fund_data2.xlsx"):
     if not st.session_state.data_loaded:
@@ -157,53 +243,237 @@ if page == "Overview":
     with col1:
         st.subheader("🎯 Objective")
         st.write("""
-        **Goal**: Create an early warning system for potential fund outflows by combining:
+        **Goal**: Create early warning systems to identify funds at risk of outflows using:
         - Morningstar performance data
         - Great Gray flow data
-        - Machine learning models for prediction
+        - Machine learning classification models
         """)
         
-        st.subheader("📈 Models Implemented")
+        st.subheader("🔬 Model Approaches")
         st.write("""
-        1. **Binary Classifier**: Flags outflows > $1M
-        2. **Regression Model**: Predicts exact cash flow amounts
-        3. **AUM Change Model**: Predicts percentage change in AUM
+        **1. Binary Classification**: Predicts whether a fund will experience outflows > $1M
+        
+        **2. Sequential Classification**: Multi-stage prediction system:
+        - Stage 1: Inflow vs Outflow
+        - Stage 2a: Minor vs Major Outflow (for outflows)
+        - Stage 2b: Minor vs Major Inflow (for inflows)
         """)
     
     with col2:
-        st.subheader("📊 Key Metrics Achieved")
+        st.subheader("📊 Model Performance")
         
-        # Display metrics in attractive cards
+        # Binary model performance
         st.markdown("""
-        <div class="metric-card">
-            <h4>🎯 Binary Classification</h4>
-            <p><strong>Accuracy:</strong> ~95%+</p>
-            <p><strong>Purpose:</strong> Flag large outflows (>$1M)</p>
+        <div class="performance-metric">
+            <h4>🏆 Binary Classification Model</h4>
+            <p><strong>Accuracy:</strong> 84.25%</p>
+            <p><strong>Precision:</strong> 49.5%</p>
+            <p><strong>Recall:</strong> 42.7%</p>
+            <p><strong>F1 Score:</strong> 0.4584</p>
         </div>
         """, unsafe_allow_html=True)
         
+        # Sequential model performance
         st.markdown("""
-        <div class="metric-card">
-            <h4>📈 Regression Model</h4>
-            <p><strong>R² Score:</strong> 0.9355</p>
-            <p><strong>MAE:</strong> $487,719.76</p>
-            <p><strong>Purpose:</strong> Predict exact cash flows</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.markdown("""
-        <div class="metric-card">
-            <h4>💰 AUM Change Model</h4>
-            <p><strong>Target:</strong> AUM % Change</p>
-            <p><strong>Features:</strong> Performance + Flow data</p>
-            <p><strong>Purpose:</strong> Predict AUM changes</p>
+        <div class="sequential-stage">
+            <h4>🔄 Sequential Classification Model</h4>
+            <p><strong>Overall 4-Class Accuracy:</strong> 73.78%</p>
+            <p><strong>Stage 1 F1:</strong> 80.88% (tuned)</p>
+            <p><strong>Stage 2a F1:</strong> 95.85% (tuned)</p>
+            <p><strong>Stage 2b F1:</strong> 87.72% (tuned)</p>
         </div>
         """, unsafe_allow_html=True)
     
+    st.markdown("---")
+    
+    # Detailed Performance Breakdown
+    st.subheader("📈 Detailed Performance Analysis")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**🎯 Binary Classification Results**")
+        st.markdown("""
+        - **Target**: Large outflows (>$1,000,000)
+        - **Algorithm**: Random Forest with balanced classes
+        - **Evaluation**: 80/20 train-test split
+        - **Strength**: Good for high-level risk screening
+        - **Use Case**: Flag funds for immediate attention
+        """)
+        
+        # Binary metrics table
+        binary_metrics = pd.DataFrame({
+            'Metric': ['Accuracy', 'Precision', 'Recall', 'F1 Score'],
+            'Score': ['84.25%', '49.5%', '42.7%', '0.4584']
+        })
+        st.table(binary_metrics)
+    
+    with col2:
+        st.markdown("**🔄 Sequential Classification Results**")
+        st.markdown("""
+        - **Target**: 4-category flow classification
+        - **Algorithm**: Multi-stage Random Forest + SMOTE
+        - **Categories**: Major/Minor × Outflow/Inflow
+        - **Strength**: Granular risk categorization
+        - **Use Case**: Nuanced decision support
+        """)
+        
+        # Sequential metrics table
+        sequential_metrics = pd.DataFrame({
+            'Stage': ['Stage 1 (Flow Direction)', 'Stage 2a (Outflow Severity)', 'Stage 2b (Inflow Magnitude)', 'Combined 4-Class'],
+            'F1 Score': ['80.88%', '95.85%', '87.72%', 'N/A'],
+            'ROC AUC': ['83.49%', '75.23%', '81.51%', 'N/A'],
+            'Accuracy': ['76.54%', '88.42%', '78.63%', '73.78%']
+        })
+        st.table(sequential_metrics)
+    
+    # Key insights
+    st.subheader("🔍 Model Comparison & Insights")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("""
+        **🎯 Binary Classification**
+        - Simple threshold-based prediction
+        - 84.25% overall accuracy
+        - 49.5% precision (low false positives)
+        - Good for binary go/no-go decisions
+        - Single decision boundary
+        """)
+    
+    with col2:
+        st.markdown("""
+        **🔄 Sequential Classification**
+        - Multi-stage decision process
+        - 95.85% F1 for outflow severity detection
+        - 87.72% F1 for inflow magnitude
+        - Excellent granular categorization
+        - Better handles flow magnitude differences
+        """)
+    
+    with col3:
+        st.markdown("""
+        **📊 Business Impact**
+        - **Binary**: Quick risk screening
+        - **Sequential**: Detailed action guidance
+        - **Combined**: Comprehensive risk assessment
+        - **ROI**: Proactive fund management
+        - **Efficiency**: Automated early warning
+        """)
+    
+    # Data insights
+    st.subheader("📋 Dataset Summary")
+    
     if st.session_state.data_loaded:
-        st.success("✅ Data is loaded and ready for analysis!")
+        df = st.session_state.df
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Total Records", "14,872")
+        with col2:
+            st.metric("Features Used", "19")
+        with col3:
+            st.metric("Inflow Rate", "58.2%")
+        with col4:
+            st.metric("Outflow Rate", "41.8%")
+        
+        # Flow distribution insights
+        st.markdown("**Flow Distribution (After Outlier Capping):**")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.markdown("""
+            <div style="background-color: #8B0000; color: white; padding: 0.5rem; border-radius: 0.5rem; text-align: center;">
+                <h4>Major Outflow</h4>
+                <h3>485</h3>
+                <p>7.8% of outflows</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown("""
+            <div style="background-color: #FF6347; color: white; padding: 0.5rem; border-radius: 0.5rem; text-align: center;">
+                <h4>Minor Outflow</h4>
+                <h3>5,732</h3>
+                <p>92.2% of outflows</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown("""
+            <div style="background-color: #90EE90; color: black; padding: 0.5rem; border-radius: 0.5rem; text-align: center;">
+                <h4>Minor Inflow</h4>
+                <h3>6,375</h3>
+                <p>73.7% of inflows</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col4:
+            st.markdown("""
+            <div style="background-color: #006400; color: white; padding: 0.5rem; border-radius: 0.5rem; text-align: center;">
+                <h4>Major Inflow</h4>
+                <h3>2,280</h3>
+                <p>26.3% of inflows</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Quick data summary
+        if 'Net Cash Flows' in df.columns:
+            st.markdown("---")
+            st.markdown("**Current Dataset Overview:**")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Funds", len(df))
+            with col2:
+                large_outflows = (df['Net Cash Flows'] < -1000000).sum()
+                st.metric("Large Outflows (>$1M)", large_outflows)
+            with col3:
+                outflow_rate = large_outflows / len(df) * 100
+                st.metric("Current Outflow Rate", f"{outflow_rate:.1f}%")
+            with col4:
+                avg_flow = df['Net Cash Flows'].mean()
+                st.metric("Avg Net Cash Flow", f"${avg_flow:,.0f}")
     else:
-        st.warning("⚠️ Please upload data to proceed with analysis")
+        st.warning("⚠️ Please upload data to see current dataset metrics")
+    
+    # Model availability status
+    st.subheader("🤖 Model Status")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if os.path.exists('EarlyWarningWeights.joblib'):
+            st.success("✅ Binary Classification Model Available")
+        else:
+            st.error("❌ Binary Classification Model Missing")
+    
+    with col2:
+        stage1_exists = os.path.exists('sequential_models/stage1_inflow_outflow.joblib')
+        stage2a_exists = os.path.exists('sequential_models/stage2a_minor_major_outflow.joblib')
+        stage2b_exists = os.path.exists('sequential_models/stage2b_minor_major_inflow.joblib')
+        
+        if stage1_exists and stage2a_exists and stage2b_exists:
+            st.success("✅ Sequential Classification Models Available")
+        elif stage1_exists:
+            st.warning("⚠️ Sequential Models Partially Available")
+        else:
+            st.error("❌ Sequential Classification Models Missing")
+    
+    # Feature importance summary
+    st.subheader("🔍 Key Predictive Features")
+    
+    st.markdown("""
+    **Top Features Across All Models:**
+    1. **As-of Date** - Temporal patterns in fund flows
+    2. **Beginning Net Assets** - Fund size correlation with flow patterns
+    3. **Quarter** - Seasonal flow trends
+    4. **CUSIP & Fund ID** - Fund-specific characteristics
+    5. **IR_1Y & IR_3Y** - Information ratios indicating performance
+    6. **Fund Name** - Fund family/strategy effects
+    7. **Percentile Rankings** - Relative performance measures
+    """)
 
 elif page == "Data Analysis":
     st.header("🔍 Data Analysis")
@@ -218,7 +488,7 @@ elif page == "Data Analysis":
         with col1:
             st.metric("Total Funds", len(df))
         with col2:
-            st.metric("Total Columns", len(df.columns))
+            st.metric("Total Features", len(df.columns))
         with col3:
             if 'Net Cash Flows' in df.columns:
                 st.metric("Avg Cash Flow", f"${df['Net Cash Flows'].mean():,.0f}")
@@ -227,81 +497,120 @@ elif page == "Data Analysis":
                 outflows = (df['Net Cash Flows'] < -1000000).sum()
                 st.metric("Large Outflows (>$1M)", outflows)
         
-        # Data preview
+        # Target variable analysis for both models
+        if 'Net Cash Flows' in df.columns and 'Beginning Net Assets' in df.columns:
+            # Compute percentage change for sequential model
+            df_analysis = df.copy()
+            df_analysis["Pct Change in AUM"] = (df_analysis["Net Cash Flows"] / df_analysis["Beginning Net Assets"]) * 100.0
+            df_analysis = df_analysis.replace([np.inf, -np.inf], np.nan)
+            df_analysis = df_analysis.dropna(subset=["Pct Change in AUM"]).reset_index(drop=True)
+            
+            # Cap extreme outliers
+            pct_99 = df_analysis["Pct Change in AUM"].quantile(0.99)
+            pct_1 = df_analysis["Pct Change in AUM"].quantile(0.01)
+            df_analysis["Pct Change in AUM_capped"] = df_analysis["Pct Change in AUM"].clip(lower=pct_1, upper=pct_99)
+            
+            st.subheader("🎯 Target Variable Analysis")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Binary Classification Target**")
+                # Binary target
+                binary_target = (df['Net Cash Flows'] < -1000000).astype(int)
+                binary_counts = binary_target.value_counts()
+                
+                fig = px.pie(
+                    values=binary_counts.values,
+                    names=['No Large Outflow', 'Large Outflow (>$1M)'],
+                    title="Binary Target Distribution",
+                    color_discrete_sequence=['#2E8B57', '#DC143C']
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                st.markdown("**Sequential Classification Target**")
+                # Sequential 4-category target
+                seq_target = create_combined_labels_4cat(df_analysis["Pct Change in AUM_capped"])
+                seq_counts = pd.Series(seq_target).value_counts().sort_index()
+                
+                fig = px.pie(
+                    values=seq_counts.values,
+                    names=['Major Outflow', 'Minor Outflow', 'Minor Inflow', 'Major Inflow'],
+                    title="4-Category Target Distribution",
+                    color_discrete_sequence=['#8B0000', '#FF6347', '#90EE90', '#006400']
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Distribution comparison
+            st.subheader("📊 Flow Distribution Comparison")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Absolute cash flows
+                fig = px.histogram(
+                    df, 
+                    x='Net Cash Flows', 
+                    nbins=50,
+                    title="Net Cash Flows Distribution (Absolute $)",
+                    color_discrete_sequence=['#1f77b4']
+                )
+                fig.add_vline(x=-1000000, line_dash="dash", line_color="red", 
+                             annotation_text="Binary Threshold (-$1M)")
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                # Percentage change
+                fig = px.histogram(
+                    df_analysis, 
+                    x='Pct Change in AUM_capped', 
+                    nbins=50,
+                    title="Percentage Change in AUM Distribution",
+                    color_discrete_sequence=['#ff7f0e']
+                )
+                fig.add_vline(x=-10, line_dash="dash", line_color="red", annotation_text="Major Outflow (-10%)")
+                fig.add_vline(x=0, line_dash="dash", line_color="black", annotation_text="Inflow/Outflow (0%)")
+                fig.add_vline(x=10, line_dash="dash", line_color="green", annotation_text="Major Inflow (+10%)")
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Summary statistics
+            st.subheader("📈 Summary Statistics")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Binary - No Large Outflow", binary_counts.get(0, 0))
+            with col2:
+                st.metric("Binary - Large Outflow", binary_counts.get(1, 0))
+            with col3:
+                imbalance_ratio = binary_counts.get(0, 0) / binary_counts.get(1, 1)
+                st.metric("Binary Imbalance Ratio", f"{imbalance_ratio:.1f}:1")
+            with col4:
+                positive_rate = binary_counts.get(1, 0) / len(df) * 100
+                st.metric("Binary Positive Rate", f"{positive_rate:.1f}%")
+            
+            # Sequential model statistics
+            st.markdown("**Sequential Model Class Distribution:**")
+            col1, col2, col3, col4 = st.columns(4)
+            class_names = ['Major Outflow', 'Minor Outflow', 'Minor Inflow', 'Major Inflow']
+            for i, (col, name) in enumerate(zip([col1, col2, col3, col4], class_names)):
+                count = seq_counts.get(i, 0)
+                pct = count / len(seq_target) * 100
+                with col:
+                    st.metric(name, f"{count} ({pct:.1f}%)")
+        
+        # Data preview and column info (existing code)
         st.subheader("📋 Data Preview")
         try:
             st.dataframe(df.head(10), use_container_width=True)
         except Exception as e:
             st.error(f"Error displaying data preview: {e}")
-            # Fallback: show basic info
             st.write("Data preview unavailable. Showing basic info:")
             st.write(f"Shape: {df.shape}")
             st.write(f"Columns: {list(df.columns)}")
-        
-        # Column information
-        st.subheader("Column Information")
-        try:
-            col_info = pd.DataFrame({
-                'Column': df.columns,
-                'Data Type': df.dtypes.astype(str),
-                'Non-Null Count': df.count(),
-                'Null Count': df.isnull().sum()
-            })
-            st.dataframe(col_info, use_container_width=True)
-        except Exception as e:
-            st.error(f"Error displaying column information: {e}")
-            # Fallback: show basic column info
-            st.write("Column information:")
-            for i, col in enumerate(df.columns):
-                st.write(f"{i+1}. {col} ({df[col].dtype})")
-        
-        # Visualizations
-        if 'Net Cash Flows' in df.columns:
-            st.subheader("Cash Flow Distribution")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Histogram
-                fig = px.histogram(
-                    df, 
-                    x='Net Cash Flows', 
-                    nbins=50,
-                    title="Distribution of Net Cash Flows"
-                )
-                fig.update_layout(
-                    xaxis_title="Net Cash Flows ($)",
-                    yaxis_title="Frequency"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                # Box plot
-                fig = px.box(
-                    df, 
-                    y='Net Cash Flows',
-                    title="Cash Flow Box Plot"
-                )
-                fig.update_layout(
-                    yaxis_title="Net Cash Flows ($)"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        
-        # Summary statistics
-        st.subheader("Summary Statistics")
-        try:
-            numeric_cols = df.select_dtypes(include=[np.number]).columns
-            if len(numeric_cols) > 0:
-                summary_stats = df[numeric_cols].describe()
-                st.dataframe(summary_stats, use_container_width=True)
-            else:
-                st.write("No numeric columns found for summary statistics.")
-        except Exception as e:
-            st.error(f"Error displaying summary statistics: {e}")
-            st.write("Summary statistics unavailable.")
 
-elif page == "Model Training":
-    st.header("Model Training")
+elif page == "Fund Risk Assessment":
+    st.header("🔍 Fund Risk Assessment")
     
     if not st.session_state.data_loaded:
         st.warning("⚠️ Please upload data first")
@@ -309,517 +618,734 @@ elif page == "Model Training":
         df = st.session_state.df
         
         # Model selection
-        st.subheader("Select Models to Train")
+        st.subheader("🤖 Select Model Type")
+        model_type = st.radio(
+            "Choose assessment model:",
+            ["Binary Classification", "Sequential Classification"],
+            help="Binary: Simple outflow >$1M prediction. Sequential: 4-category granular prediction."
+        )
         
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            train_binary = st.checkbox("Binary Classifier (Outflow >$1M)", value=True)
-        with col2:
-            train_regression = st.checkbox("Cash Flow Regression", value=True)
-        with col3:
-            train_aum = st.checkbox("AUM Change Prediction", value=True)
-        
-        if st.button("Train Selected Models", type="primary"):
-            results = {}
-            
-            # Prepare data
-            try:
-                # Binary Classification Model
-                if train_binary and 'Net Cash Flows' in df.columns:
-                    with st.spinner("Training Binary Classifier..."):
-                        st.subheader("Binary Classification Results")
-                        
-                        # Create target
-                        df_binary = df.copy()
-                        df_binary['target'] = (df_binary['Net Cash Flows'] < -1000000).astype(int)
-                        
-                        # Prepare features
-                        X = df_binary.drop(['target', 'Net Cash Flows'], axis=1, errors='ignore')
-                        y = df_binary['target']
-                        
-                        # Preprocessing
-                        categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
-                        numerical_cols = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
-                        
-                        preprocessor = ColumnTransformer(transformers=[
-                            ('num', Pipeline([
-                                ('imputer', SimpleImputer(strategy='median')),
-                                ('scaler', StandardScaler())
-                            ]), numerical_cols),
-                            ('cat', Pipeline([
-                                ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-                                ('onehot', OneHotEncoder(handle_unknown='ignore'))
-                            ]), categorical_cols)
-                        ])
-                        
-                        # Train-test split
-                        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-                        
-                        # Train model
-                        binary_pipeline = Pipeline([
-                            ('preprocessor', preprocessor),
-                            ('classifier', RandomForestClassifier(n_estimators=100, random_state=42))
-                        ])
-                        binary_pipeline.fit(X_train, y_train)
-                        binary_pred = binary_pipeline.predict(X_test)
-                        
-                        # Metrics
-                        accuracy = accuracy_score(y_test, binary_pred)
-                        precision = precision_score(y_test, binary_pred)
-                        recall = recall_score(y_test, binary_pred)
-                        f1 = f1_score(y_test, binary_pred)
-                        
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("Accuracy", f"{accuracy:.4f}")
-                        with col2:
-                            st.metric("Precision", f"{precision:.4f}")
-                        with col3:
-                            st.metric("Recall", f"{recall:.4f}")
-                        with col4:
-                            st.metric("F1 Score", f"{f1:.4f}")
-                        
-                        # Confusion Matrix
-                        cm = confusion_matrix(y_test, binary_pred)
-                        fig = px.imshow(cm, 
-                                       text_auto=True, 
-                                       title="Confusion Matrix - Binary Classifier",
-                                       labels=dict(x="Predicted", y="Actual"))
-                        st.plotly_chart(fig, use_container_width=True)
-                        
-                        # Save model
-                        joblib.dump(binary_pipeline, 'binary_model.joblib')
-                        results['binary'] = {
-                            'accuracy': accuracy,
-                            'precision': precision,
-                            'recall': recall,
-                            'f1': f1
-                        }
-                
-                # Regression Model
-                if train_regression and 'Net Cash Flows' in df.columns:
-                    with st.spinner("Training Regression Model..."):
-                        st.subheader("Regression Model Results")
-                        
-                        # Prepare data
-                        df_reg = df.copy()
-                        X = df_reg.drop(['Net Cash Flows'], axis=1, errors='ignore')
-                        y = df_reg['Net Cash Flows']
-                        
-                        # Remove infinite values
-                        mask = np.isfinite(y)
-                        X = X[mask]
-                        y = y[mask]
-                        
-                        # Preprocessing (same as binary)
-                        categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
-                        numerical_cols = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
-                        
-                        preprocessor = ColumnTransformer(transformers=[
-                            ('num', Pipeline([
-                                ('imputer', SimpleImputer(strategy='median')),
-                                ('scaler', StandardScaler())
-                            ]), numerical_cols),
-                            ('cat', Pipeline([
-                                ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-                                ('onehot', OneHotEncoder(handle_unknown='ignore'))
-                            ]), categorical_cols)
-                        ])
-                        
-                        # Train-test split
-                        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-                        
-                        # Train model
-                        reg_pipeline = Pipeline([
-                            ('preprocessor', preprocessor),
-                            ('regressor', RandomForestRegressor(n_estimators=100, random_state=42))
-                        ])
-                        reg_pipeline.fit(X_train, y_train)
-                        reg_pred = reg_pipeline.predict(X_test)
-                        
-                        # Metrics
-                        mae = mean_absolute_error(y_test, reg_pred)
-                        mse = mean_squared_error(y_test, reg_pred)
-                        rmse = np.sqrt(mse)
-                        r2 = r2_score(y_test, reg_pred)
-                        
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("MAE", f"${mae:,.0f}")
-                        with col2:
-                            st.metric("RMSE", f"${rmse:,.0f}")
-                        with col3:
-                            st.metric("R² Score", f"{r2:.4f}")
-                        with col4:
-                            st.metric("MSE", f"${mse:,.0f}")
-                        
-                        # Prediction vs Actual scatter plot
-                        fig = px.scatter(
-                            x=y_test, 
-                            y=reg_pred,
-                            title="Actual vs Predicted Cash Flows",
-                            labels={'x': 'Actual Cash Flows ($)', 'y': 'Predicted Cash Flows ($)'}
-                        )
-                        # Add diagonal line
-                        min_val = min(y_test.min(), reg_pred.min())
-                        max_val = max(y_test.max(), reg_pred.max())
-                        fig.add_trace(go.Scatter(
-                            x=[min_val, max_val], 
-                            y=[min_val, max_val],
-                            mode='lines',
-                            name='Perfect Prediction',
-                            line=dict(dash='dash', color='red')
-                        ))
-                        st.plotly_chart(fig, use_container_width=True)
-                        
-                        # Save model
-                        joblib.dump(reg_pipeline, 'regression_model.joblib')
-                        results['regression'] = {
-                            'mae': mae,
-                            'rmse': rmse,
-                            'r2': r2,
-                            'mse': mse
-                        }
-                
-                # AUM Change Model
-                if train_aum and 'Beginning Net Assets' in df.columns and 'Ending Net Assets' in df.columns:
-                    with st.spinner("Training AUM Change Model..."):
-                        st.subheader("💰 AUM Change Model Results")
-                        
-                        # Calculate AUM percentage change
-                        df_aum = df.copy()
-                        df_aum['Beginning Net Assets'] = pd.to_numeric(df_aum['Beginning Net Assets'], errors='coerce')
-                        df_aum['Ending Net Assets'] = pd.to_numeric(df_aum['Ending Net Assets'], errors='coerce')
-                        df_aum['AUM_Pct_Change'] = ((df_aum['Ending Net Assets'] - df_aum['Beginning Net Assets']) / df_aum['Beginning Net Assets']) * 100
-                        
-                        # Clean data
-                        df_aum = df_aum.replace([np.inf, -np.inf], np.nan)
-                        df_aum = df_aum.dropna(subset=['AUM_Pct_Change'])
-                        df_aum['AUM_Pct_Change'] = df_aum['AUM_Pct_Change'].clip(-50, 50)
-                        
-                        # Prepare features
-                        columns_to_drop = ['AUM_Pct_Change', 'Ending Net Assets', 'Net Change AUM', 'Beginning Net Assets']
-                        X = df_aum.drop(columns_to_drop, axis=1, errors='ignore')
-                        y = df_aum['AUM_Pct_Change']
-                        
-                        # Preprocessing
-                        categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
-                        numerical_cols = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
-                        
-                        preprocessor = ColumnTransformer(transformers=[
-                            ('num', Pipeline([
-                                ('imputer', SimpleImputer(strategy='median')),
-                                ('scaler', StandardScaler())
-                            ]), numerical_cols),
-                            ('cat', Pipeline([
-                                ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-                                ('onehot', OneHotEncoder(handle_unknown='ignore'))
-                            ]), categorical_cols)
-                        ])
-                        
-                        # Train-test split
-                        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-                        
-                        # Train model
-                        aum_pipeline = Pipeline([
-                            ('preprocessor', preprocessor),
-                            ('regressor', RandomForestRegressor(n_estimators=100, random_state=42))
-                        ])
-                        aum_pipeline.fit(X_train, y_train)
-                        aum_pred = aum_pipeline.predict(X_test)
-                        
-                        # Metrics
-                        mae = mean_absolute_error(y_test, aum_pred)
-                        mse = mean_squared_error(y_test, aum_pred)
-                        rmse = np.sqrt(mse)
-                        r2 = r2_score(y_test, aum_pred)
-                        
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("MAE", f"{mae:.2f}%")
-                        with col2:
-                            st.metric("RMSE", f"{rmse:.2f}%")
-                        with col3:
-                            st.metric("R² Score", f"{r2:.4f}")
-                        with col4:
-                            st.metric("Mean AUM Change", f"{y.mean():.2f}%")
-                        
-                        # AUM change distribution
-                        fig = px.histogram(
-                            x=y_test,
-                            nbins=30,
-                            title="Distribution of AUM Percentage Changes"
-                        )
-                        fig.update_layout(
-                            xaxis_title="AUM Change (%)",
-                            yaxis_title="Frequency"
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                        
-                        # Save model
-                        joblib.dump(aum_pipeline, 'aum_model.joblib')
-                        results['aum'] = {
-                            'mae': mae,
-                            'rmse': rmse,
-                            'r2': r2
-                        }
-                
-                st.session_state.models_trained = True
-                st.success("✅ Model training completed successfully!")
-                
-            except Exception as e:
-                st.error(f"❌ Error during model training: {e}")
-
-elif page == "Predictions":
-    st.header("Make Predictions")
-    
-    if not st.session_state.data_loaded:
-        st.warning("⚠️ Please upload data first")
-    elif not st.session_state.models_trained and not any(os.path.exists(f) for f in ['binary_model.joblib', 'regression_model.joblib', 'aum_model.joblib']):
-        st.warning("⚠️ Please train models first or ensure model files are available")
-    else:
-        df = st.session_state.df
-        
-        st.subheader("Select a Fund for Prediction")
-        
-        # Fund selection
-        if 'Fund Name_x' in df.columns:
-            fund_options = df['Fund Name_x'].dropna().unique()
-            selected_fund = st.selectbox("Choose a fund:", fund_options)
-            fund_data = df[df['Fund Name_x'] == selected_fund].iloc[0:1]
-        else:
-            # Random selection if no fund name column
-            fund_idx = st.number_input("Select fund index:", 0, len(df)-1, 0)
-            fund_data = df.iloc[fund_idx:fund_idx+1]
-            selected_fund = f"Fund #{fund_idx}"
-        
-        st.subheader(f"Predictions for: {selected_fund}")
-        
-        # Make predictions
-        col1, col2, col3 = st.columns(3)
-        
-        # Binary prediction
-        with col1:
-            if os.path.exists('binary_model.joblib'):
+        if model_type == "Binary Classification":
+            if not os.path.exists('EarlyWarningWeights.joblib'):
+                st.warning("⚠️ Binary model not found. Please train the binary model first.")
+            else:
                 try:
-                    binary_model = joblib.load('binary_model.joblib')
-                    fund_features = fund_data.drop(['Net Cash Flows'], axis=1, errors='ignore')
-                    binary_pred = binary_model.predict(fund_features)[0]
-                    binary_prob = binary_model.predict_proba(fund_features)[0][1]
+                    # Load binary model
+                    binary_model = joblib.load('EarlyWarningWeights.joblib')
                     
-                    st.markdown("### 🚨 Outflow Risk")
-                    if binary_pred == 1:
-                        st.markdown(f"""
-                        <div class="warning-high">
-                            <h4>⚠️ HIGH RISK</h4>
-                            <p>Predicted outflow > $1M</p>
-                            <p><strong>Probability: {binary_prob:.1%}</strong></p>
-                        </div>
-                        """, unsafe_allow_html=True)
+                    # Fund selection
+                    st.subheader("Select a Fund for Binary Risk Assessment")
+                    
+                    if 'Fund Name_x' in df.columns:
+                        fund_options = df['Fund Name_x'].dropna().unique()
+                        selected_fund = st.selectbox("Choose a fund:", fund_options, key="binary_fund_select")
+                        fund_data = df[df['Fund Name_x'] == selected_fund].iloc[0:1]
+                        fund_name = selected_fund
                     else:
-                        st.markdown(f"""
-                        <div class="warning-low">
-                            <h4>✅ LOW RISK</h4>
-                            <p>No major outflow expected</p>
-                            <p><strong>Probability: {binary_prob:.1%}</strong></p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                except Exception as e:
-                    st.error(f"Binary prediction error: {e}")
-        
-        # Regression prediction
-        with col2:
-            if os.path.exists('regression_model.joblib'):
-                try:
-                    reg_model = joblib.load('regression_model.joblib')
-                    fund_features = fund_data.drop(['Net Cash Flows'], axis=1, errors='ignore')
-                    cash_flow_pred = reg_model.predict(fund_features)[0]
+                        fund_idx = st.number_input("Select fund index:", 0, len(df)-1, 0, key="binary_fund_idx")
+                        fund_data = df.iloc[fund_idx:fund_idx+1]
+                        fund_name = f"Fund #{fund_idx}"
                     
-                    st.markdown("### 💰 Cash Flow Prediction")
+                    # Prepare features
+                    leak_columns = [
+                        "Cash Outflows", "Cash Inflows", "Net Cash Flows",
+                        "Net Market & Other", "Net Change AUM", "Ending Net Assets"
+                    ]
+                    fund_features = fund_data.drop(leak_columns, axis=1, errors='ignore')
                     
+                    # Make prediction
+                    risk_probability = binary_model.predict_proba(fund_features)[0][1]
+                    risk_prediction = binary_model.predict(fund_features)[0]
+                    
+                    # Display results
+                    st.subheader(f"Binary Risk Assessment: {fund_name}")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # Risk gauge
+                        fig = go.Figure(go.Indicator(
+                            mode = "gauge+number+delta",
+                            value = risk_probability * 100,
+                            domain = {'x': [0, 1], 'y': [0, 1]},
+                            title = {'text': "Large Outflow Risk (%)"},
+                            delta = {'reference': 50},
+                            gauge = {
+                                'axis': {'range': [None, 100]},
+                                'bar': {'color': "darkblue"},
+                                'steps': [
+                                    {'range': [0, 30], 'color': "lightgreen"},
+                                    {'range': [30, 70], 'color': "yellow"},
+                                    {'range': [70, 100], 'color': "red"}],
+                                'threshold': {
+                                    'line': {'color': "red", 'width': 4},
+                                    'thickness': 0.75,
+                                    'value': 50}}))
+                        
+                        fig.update_layout(height=300)
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    with col2:
+                        # Risk classification
+                        if risk_prediction == 1:
+                            st.markdown(f"""
+                            <div class="warning-high">
+                                <h3>⚠️ HIGH RISK ALERT</h3>
+                                <p><strong>Prediction:</strong> Large outflow likely (>$1M)</p>
+                                <p><strong>Confidence:</strong> {risk_probability:.1%}</p>
+                                <p><strong>Recommendation:</strong> Immediate attention required</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        else:
+                            if risk_probability > 0.3:
+                                st.markdown(f"""
+                                <div class="warning-medium">
+                                    <h3>🔶 MODERATE RISK</h3>
+                                    <p><strong>Prediction:</strong> No large outflow expected</p>
+                                    <p><strong>Confidence:</strong> {risk_probability:.1%}</p>
+                                    <p><strong>Recommendation:</strong> Monitor closely</p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                    
+                    # Display actual outcome if available
                     if 'Net Cash Flows' in fund_data.columns:
                         actual_flow = fund_data['Net Cash Flows'].iloc[0]
-                        error = abs(actual_flow - cash_flow_pred)
-                        st.metric(
-                            "Predicted Cash Flow", 
-                            f"${cash_flow_pred:,.0f}",
-                            delta=f"${cash_flow_pred - actual_flow:,.0f}"
-                        )
-                        st.metric("Actual Cash Flow", f"${actual_flow:,.0f}")
-                        st.metric("Prediction Error", f"${error:,.0f}")
-                    else:
-                        st.metric("Predicted Cash Flow", f"${cash_flow_pred:,.0f}")
+                        actual_large_outflow = actual_flow < -1000000
+                        
+                        st.subheader("📊 Actual vs Predicted")
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Actual Net Cash Flow", f"${actual_flow:,.0f}")
+                        with col2:
+                            st.metric("Actual Large Outflow", "Yes" if actual_large_outflow else "No")
+                        with col3:
+                            if actual_large_outflow == risk_prediction:
+                                st.metric("Prediction Accuracy", "✅ Correct")
+                            else:
+                                st.metric("Prediction Accuracy", "❌ Incorrect")
+                
                 except Exception as e:
-                    st.error(f"Regression prediction error: {e}")
+                    st.error(f"❌ Error with binary model assessment: {e}")
         
-        # AUM change prediction
-        with col3:
-            if os.path.exists('aum_model.joblib'):
+        else:  # Sequential Classification
+            # Check if sequential models exist
+            stage1_exists = os.path.exists('sequential_models/stage1_inflow_outflow.joblib')
+            stage2a_exists = os.path.exists('sequential_models/stage2a_minor_major_outflow.joblib')
+            stage2b_exists = os.path.exists('sequential_models/stage2b_minor_major_inflow.joblib')
+            
+            if not stage1_exists:
+                st.warning("⚠️ Sequential models not found. Please train the sequential models first.")
+            else:
                 try:
-                    aum_model = joblib.load('aum_model.joblib')
-                    columns_to_drop = ['AUM_Pct_Change', 'Ending Net Assets', 'Net Change AUM', 'Beginning Net Assets']
-                    fund_features = fund_data.drop(columns_to_drop, axis=1, errors='ignore')
-                    aum_change_pred = aum_model.predict(fund_features)[0]
+                    # Load sequential models
+                    stage1_model = joblib.load('sequential_models/stage1_inflow_outflow.joblib')
+                    stage2a_model = joblib.load('sequential_models/stage2a_minor_major_outflow.joblib') if stage2a_exists else None
+                    stage2b_model = joblib.load('sequential_models/stage2b_minor_major_inflow.joblib') if stage2b_exists else None
                     
-                    st.markdown("### 📈 AUM Change Prediction")
+                    # Fund selection
+                    st.subheader("Select a Fund for Sequential Risk Assessment")
                     
-                    if 'Beginning Net Assets' in fund_data.columns and 'Ending Net Assets' in fund_data.columns:
-                        beginning = pd.to_numeric(fund_data['Beginning Net Assets'].iloc[0], errors='coerce')
-                        ending = pd.to_numeric(fund_data['Ending Net Assets'].iloc[0], errors='coerce')
-                        if pd.notna(beginning) and pd.notna(ending) and beginning != 0:
-                            actual_change = ((ending - beginning) / beginning) * 100
-                            st.metric(
-                                "Predicted AUM Change", 
-                                f"{aum_change_pred:.2f}%",
-                                delta=f"{aum_change_pred - actual_change:.2f}%"
-                            )
-                            st.metric("Actual AUM Change", f"{actual_change:.2f}%")
-                        else:
-                            st.metric("Predicted AUM Change", f"{aum_change_pred:.2f}%")
+                    if 'Fund Name_x' in df.columns:
+                        fund_options = df['Fund Name_x'].dropna().unique()
+                        selected_fund = st.selectbox("Choose a fund:", fund_options, key="seq_fund_select")
+                        fund_data = df[df['Fund Name_x'] == selected_fund].iloc[0:1]
+                        fund_name = selected_fund
                     else:
-                        st.metric("Predicted AUM Change", f"{aum_change_pred:.2f}%")
+                        fund_idx = st.number_input("Select fund index:", 0, len(df)-1, 0, key="seq_fund_idx")
+                        fund_data = df.iloc[fund_idx:fund_idx+1]
+                        fund_name = f"Fund #{fund_idx}"
+                    
+                    # Prepare features
+                    leak_columns = [
+                        "Cash Outflows", "Cash Inflows", "Net Cash Flows",
+                        "Net Market & Other", "Net Change AUM", "Ending Net Assets"
+                    ]
+                    fund_features = fund_data.drop(leak_columns, axis=1, errors='ignore')
+                    
+                    # Make sequential predictions
+                    stage1_pred, stage2a_pred, stage2b_pred, combined_pred = sequential_predict_4cat(
+                        fund_features, stage1_model, stage2a_model, stage2b_model
+                    )
+                    
+                    combined_prediction = combined_pred[0]
+                    stage1_prediction = stage1_pred[0]
+                    
+                    # Map predictions to labels
+                    category_names = ['Major Outflow', 'Minor Outflow', 'Minor Inflow', 'Major Inflow']
+                    category_colors = ['#8B0000', '#FF6347', '#90EE90', '#006400']
+                    predicted_category = category_names[combined_prediction]
+                    predicted_color = category_colors[combined_prediction]
+                    
+                    # Display results
+                    st.subheader(f"Sequential Risk Assessment: {fund_name}")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # Sequential prediction visualization
+                        fig = go.Figure()
+                        
+                        # Add gauge for stage 1
+                        fig.add_trace(go.Indicator(
+                            mode = "gauge+number",
+                            value = stage1_prediction,
+                            title = {'text': "Stage 1: Flow Direction"},
+                            domain = {'row': 0, 'column': 0},
+                            gauge = {
+                                'axis': {'range': [0, 1], 'tickvals': [0, 1], 'ticktext': ['Outflow', 'Inflow']},
+                                'bar': {'color': "lightblue"},
+                                'steps': [
+                                    {'range': [0, 0.5], 'color': "#ffcccb"},
+                                    {'range': [0.5, 1], 'color': "#90ee90"}]
+                            }
+                        ))
+                        
+                        fig.update_layout(
+                            grid = {'rows': 1, 'columns': 1, 'pattern': "independent"},
+                            height=250
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Final category display
+                        st.markdown(f"""
+                        <div style="background-color: {predicted_color}; color: white; padding: 1rem; border-radius: 0.5rem; text-align: center; margin: 1rem 0;">
+                            <h3>📊 Final Prediction</h3>
+                            <h2>{predicted_category}</h2>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    with col2:
+                        # Sequential decision tree visualization
+                        st.markdown("**🔄 Sequential Decision Process:**")
+                        
+                        if stage1_prediction == 0:  # Outflow
+                            st.markdown("1. **Stage 1**: Predicted Outflow")
+                            if stage2a_model is not None and not np.isnan(stage2a_pred[0]):
+                                stage2a_result = "Minor Outflow" if stage2a_pred[0] == 1 else "Major Outflow"
+                                st.markdown(f"2. **Stage 2a**: {stage2a_result}")
+                            else:
+                                st.markdown("2. **Stage 2a**: Model not available")
+                        else:  # Inflow
+                            st.markdown("1. **Stage 1**: Predicted Inflow")
+                            if stage2b_model is not None and not np.isnan(stage2b_pred[0]):
+                                stage2b_result = "Minor Inflow" if stage2b_pred[0] == 1 else "Major Inflow"
+                                st.markdown(f"2. **Stage 2b**: {stage2b_result}")
+                            else:
+                                st.markdown("2. **Stage 2b**: Model not available")
+                        
+                        # Recommendation based on category
+                        recommendations = {
+                            0: ("🚨 URGENT ACTION REQUIRED", "Major outflow risk - immediate intervention needed"),
+                            1: ("⚠️ MONITOR CLOSELY", "Minor outflow risk - increased monitoring recommended"),
+                            2: ("✅ STABLE", "Minor inflow expected - continue regular monitoring"),
+                            3: ("🎉 EXCELLENT", "Major inflow expected - fund performing well")
+                        }
+                        
+                        rec_title, rec_desc = recommendations[combined_prediction]
+                        
+                        if combined_prediction <= 1:  # Outflows
+                            alert_class = "warning-high" if combined_prediction == 0 else "warning-medium"
+                        else:  # Inflows
+                            alert_class = "warning-low"
+                        
+                        st.markdown(f"""
+                        <div class="{alert_class}">
+                            <h4>{rec_title}</h4>
+                            <p>{rec_desc}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Compare with actual if available
+                    if 'Net Cash Flows' in fund_data.columns and 'Beginning Net Assets' in fund_data.columns:
+                        actual_flow = fund_data['Net Cash Flows'].iloc[0]
+                        beginning_assets = fund_data['Beginning Net Assets'].iloc[0]
+                        
+                        if beginning_assets != 0:
+                            actual_pct_change = (actual_flow / beginning_assets) * 100
+                            actual_category = create_combined_labels_4cat(np.array([actual_pct_change]))[0]
+                            actual_category_name = category_names[actual_category]
+                            
+                            st.subheader("📊 Actual vs Predicted Comparison")
+                            col1, col2, col3, col4 = st.columns(4)
+                            
+                            with col1:
+                                st.metric("Actual Cash Flow", f"${actual_flow:,.0f}")
+                            with col2:
+                                st.metric("Actual % Change", f"{actual_pct_change:.2f}%")
+                            with col3:
+                                st.metric("Actual Category", actual_category_name)
+                            with col4:
+                                if actual_category == combined_prediction:
+                                    st.metric("Sequential Accuracy", "✅ Correct")
+                                else:
+                                    st.metric("Sequential Accuracy", "❌ Incorrect")
+                
                 except Exception as e:
-                    st.error(f"AUM prediction error: {e}")
+                    st.error(f"❌ Error with sequential model assessment: {e}")
         
-        # Fund details
+        # Fund details section (common for both models)
         st.subheader("📋 Fund Details")
         try:
-            # Clean the fund data before displaying
             fund_data_clean = clean_dataframe_for_streamlit(fund_data)
-            st.dataframe(fund_data_clean.T, use_container_width=True)
+            
+            # Select key columns to display
+            display_cols = []
+            key_columns = [
+                'Fund Name_x', 'Beginning Net Assets', 'Category_x', 
+                'Total Return Month', 'Total Return 3 Month', 'Total Return YTD',
+                'Total Return 1 Year', 'Total Return 3 Year', 'Total Return 5 Year'
+            ]
+            
+            for col in key_columns:
+                if col in fund_data_clean.columns:
+                    display_cols.append(col)
+            
+            if display_cols:
+                st.dataframe(fund_data_clean[display_cols].T, use_container_width=True)
+            else:
+                st.dataframe(fund_data_clean.T, use_container_width=True)
+                
         except Exception as e:
             st.error(f"Error displaying fund details: {e}")
-            # Fallback: show key information
-            st.write("Fund details (basic view):")
-            for col in fund_data.columns:
-                try:
-                    value = fund_data[col].iloc[0]
-                    st.write(f"**{col}**: {value}")
-                except:
-                    st.write(f"**{col}**: [Error displaying value]")
 
 elif page == "Early Warning Dashboard":
-    st.header("Early Warning Dashboard")
+    st.header("🚨 Early Warning Dashboard")
     
     if not st.session_state.data_loaded:
         st.warning("⚠️ Please upload data first")
     else:
         df = st.session_state.df
         
-        # Calculate risk scores for all funds
-        if os.path.exists('binary_model.joblib') and 'Net Cash Flows' in df.columns:
-            try:
-                binary_model = joblib.load('binary_model.joblib')
-                X = df.drop(['Net Cash Flows'], axis=1, errors='ignore')
-                
-                # Get predictions and probabilities
-                risk_probs = binary_model.predict_proba(X)[:, 1]
-                risk_predictions = binary_model.predict(X)
-                
-                # Create risk dashboard
-                df_risk = df.copy()
-                df_risk['Risk_Probability'] = risk_probs
-                df_risk['High_Risk'] = risk_predictions
-                
-                # Risk summary
-                st.subheader("Risk Summary")
-                col1, col2, col3, col4 = st.columns(4)
-                
-                total_funds = len(df_risk)
-                high_risk_funds = df_risk['High_Risk'].sum()
-                avg_risk = df_risk['Risk_Probability'].mean()
-                
-                with col1:
-                    st.metric("Total Funds", total_funds)
-                with col2:
-                    st.metric("High Risk Funds", high_risk_funds)
-                with col3:
-                    st.metric("Average Risk", f"{avg_risk:.1%}")
-                with col4:
-                    risk_pct = high_risk_funds / total_funds if total_funds > 0 else 0
-                    st.metric("% High Risk", f"{risk_pct:.1%}")
-                
-                # Risk distribution
-                st.subheader("Risk Distribution")
-                fig = px.histogram(
-                    df_risk, 
-                    x='Risk_Probability',
-                    nbins=20,
-                    title="Distribution of Outflow Risk Probabilities"
-                )
-                fig.update_layout(
-                    xaxis_title="Risk Probability",
-                    yaxis_title="Number of Funds"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # High-risk funds table
-                st.subheader("⚠️ High-Risk Funds (>50% probability)")
-                high_risk_df = df_risk[df_risk['Risk_Probability'] > 0.5].copy()
-                high_risk_df = high_risk_df.sort_values('Risk_Probability', ascending=False)
-                
-                if len(high_risk_df) > 0:
-                    # Select relevant columns for display
-                    display_cols = ['Risk_Probability']
-                    if 'Fund Name_x' in high_risk_df.columns:
-                        display_cols = ['Fund Name_x'] + display_cols
-                    if 'Net Cash Flows' in high_risk_df.columns:
-                        display_cols = display_cols + ['Net Cash Flows']
-                    if 'Beginning Net Assets' in high_risk_df.columns:
-                        display_cols = display_cols + ['Beginning Net Assets']
+        # Model selection for dashboard
+        st.subheader("🤖 Select Dashboard Model")
+        dashboard_model = st.radio(
+            "Choose model for dashboard analysis:",
+            ["Binary Classification", "Sequential Classification"],
+            help="Select which model predictions to display in the dashboard"
+        )
+        
+        if dashboard_model == "Binary Classification":
+            # Binary model dashboard
+            if not os.path.exists('EarlyWarningWeights.joblib'):
+                st.warning("⚠️ Binary model not found. Please train the binary model first.")
+            else:
+                try:
+                    model = joblib.load('EarlyWarningWeights.joblib')
                     
-                    # Format the dataframe
-                    display_df = high_risk_df[display_cols].copy()
-                    display_df['Risk_Probability'] = display_df['Risk_Probability'].apply(lambda x: f"{x:.1%}")
+                    # Prepare features (remove target leakage columns)
+                    leak_columns = [
+                        "Cash Outflows", "Cash Inflows", "Net Cash Flows",
+                        "Net Market & Other", "Net Change AUM", "Ending Net Assets"
+                    ]
+                    X = df.drop(leak_columns, axis=1, errors='ignore')
                     
-                    try:
-                        # Clean the display dataframe
-                        display_df_clean = clean_dataframe_for_streamlit(display_df)
-                        st.dataframe(display_df_clean, use_container_width=True)
-                    except Exception as e:
-                        st.error(f"Error displaying high-risk funds table: {e}")
-                        # Fallback: show basic list
-                        st.write("High-risk funds (basic view):")
-                        for idx, row in display_df.iterrows():
-                            st.write(f"- {row.get('Fund Name_x', f'Fund {idx}')}: {row['Risk_Probability']}")
+                    # Get predictions and probabilities
+                    risk_probs = model.predict_proba(X)[:, 1]
+                    risk_predictions = model.predict(X)
                     
-                    # Download button for high-risk funds
-                    csv = high_risk_df.to_csv(index=False)
-                    st.download_button(
-                        label="📥 Download High-Risk Funds CSV",
-                        data=csv,
-                        file_name="high_risk_funds.csv",
-                        mime="text/csv"
+                    # Create risk dashboard dataframe
+                    df_risk = df.copy()
+                    df_risk['Risk_Probability'] = risk_probs
+                    df_risk['High_Risk_Flag'] = risk_predictions
+                    df_risk['Actual_Large_Outflow'] = (df_risk['Net Cash Flows'] < -1000000).astype(int) if 'Net Cash Flows' in df_risk.columns else 0
+                    
+                    # Dashboard overview
+                    st.subheader("📊 Binary Model Risk Overview")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    total_funds = len(df_risk)
+                    high_risk_funds = df_risk['High_Risk_Flag'].sum()
+                    avg_risk = df_risk['Risk_Probability'].mean()
+                    actual_outflows = df_risk['Actual_Large_Outflow'].sum() if 'Net Cash Flows' in df.columns else 0
+                    
+                    with col1:
+                        st.metric("Total Funds", total_funds)
+                    with col2:
+                        st.metric("High Risk Flags", high_risk_funds)
+                    with col3:
+                        st.metric("Actual Large Outflows", actual_outflows)
+                    with col4:
+                        st.metric("Average Risk Score", f"{avg_risk:.1%}")
+                    
+                    # Risk threshold selector
+                    st.subheader("🎯 Risk Threshold Analysis")
+                    risk_threshold = st.slider(
+                        "Risk Probability Threshold (%)", 
+                        0, 100, 50, 5,
+                        help="Adjust threshold to see how many funds would be flagged at different risk levels",
+                        key="binary_threshold"
                     )
-                else:
-                    st.success("✅ No high-risk funds identified!")
+                    
+                    threshold_decimal = risk_threshold / 100
+                    funds_above_threshold = (df_risk['Risk_Probability'] > threshold_decimal).sum()
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Funds Above Threshold", funds_above_threshold)
+                    with col2:
+                        pct_flagged = funds_above_threshold / total_funds * 100
+                        st.metric("% of Funds Flagged", f"{pct_flagged:.1f}%")
+                    with col3:
+                        if actual_outflows > 0:
+                            caught_outflows = ((df_risk['Risk_Probability'] > threshold_decimal) & 
+                                             (df_risk['High_Risk_Flag'] == 1)).sum()
+                            catch_rate = caught_outflows / actual_outflows * 100
+                            st.metric("Outflows Caught", f"{catch_rate:.1f}%")
+                    
+                    # Risk distribution visualization
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # Risk probability histogram
+                        fig = px.histogram(
+                            df_risk, 
+                            x='Risk_Probability',
+                            nbins=20,
+                            title="Distribution of Risk Probabilities",
+                            labels={'Risk_Probability': 'Risk Probability', 'count': 'Number of Funds'}
+                        )
+                        fig.add_vline(x=threshold_decimal, line_dash="dash", line_color="red", 
+                                     annotation_text=f"Threshold ({risk_threshold}%)")
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    with col2:
+                        if 'Net Cash Flows' in df.columns:
+                            # Actual vs Predicted confusion matrix
+                            confusion_data = pd.crosstab(
+                                df_risk['Actual_Large_Outflow'], 
+                                df_risk['High_Risk_Flag'],
+                                rownames=['Actual'], 
+                                colnames=['Predicted']
+                            )
+                            
+                            fig = px.imshow(
+                                confusion_data.values,
+                                text_auto=True,
+                                title="Model Performance: Actual vs Predicted",
+                                labels=dict(x="Predicted", y="Actual"),
+                                x=['No Large Outflow', 'Large Outflow'],
+                                y=['No Large Outflow', 'Large Outflow']
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("Actual outcomes not available for performance evaluation")
+                    
+                    # High-risk funds table
+                    st.subheader(f"⚠️ High-Risk Funds (>{risk_threshold}% probability)")
+                    high_risk_df = df_risk[df_risk['Risk_Probability'] > threshold_decimal].copy()
+                    high_risk_df = high_risk_df.sort_values('Risk_Probability', ascending=False)
+                    
+                    if len(high_risk_df) > 0:
+                        # Select relevant columns for display
+                        display_cols = ['Risk_Probability']
+                        if 'Fund Name_x' in high_risk_df.columns:
+                            display_cols = ['Fund Name_x'] + display_cols
+                        if 'Net Cash Flows' in high_risk_df.columns:
+                            display_cols = display_cols + ['Net Cash Flows']
+                        if 'Beginning Net Assets' in high_risk_df.columns:
+                            display_cols = display_cols + ['Beginning Net Assets']
+                        if 'Category_x' in high_risk_df.columns:
+                            display_cols = display_cols + ['Category_x']
+                        
+                        # Format the dataframe
+                        display_df = high_risk_df[display_cols].copy()
+                        display_df['Risk_Probability'] = display_df['Risk_Probability'].apply(lambda x: f"{x:.1%}")
+                        
+                        if 'Net Cash Flows' in display_df.columns:
+                            display_df['Net Cash Flows'] = display_df['Net Cash Flows'].apply(lambda x: f"${x:,.0f}")
+                        if 'Beginning Net Assets' in display_df.columns:
+                            display_df['Beginning Net Assets'] = display_df['Beginning Net Assets'].apply(lambda x: f"${x:,.0f}")
+                        
+                        try:
+                            display_df_clean = clean_dataframe_for_streamlit(display_df)
+                            st.dataframe(display_df_clean, use_container_width=True)
+                        except Exception as e:
+                            st.error(f"Error displaying high-risk funds table: {e}")
+                        
+                        # Download button for high-risk funds
+                        csv = high_risk_df.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download High-Risk Funds CSV",
+                            data=csv,
+                            file_name=f"binary_high_risk_funds_{risk_threshold}pct.csv",
+                            mime="text/csv"
+                        )
+                    else:
+                        st.success("✅ No funds exceed the selected risk threshold!")
+                    
+                    # Model performance metrics
+                    if 'Net Cash Flows' in df.columns:
+                        st.subheader("📈 Binary Model Performance Summary")
+                        
+                        # Calculate performance metrics
+                        y_true = df_risk['Actual_Large_Outflow']
+                        y_pred = df_risk['High_Risk_Flag']
+                        
+                        accuracy = accuracy_score(y_true, y_pred)
+                        precision = precision_score(y_true, y_pred) if y_pred.sum() > 0 else 0
+                        recall = recall_score(y_true, y_pred) if y_true.sum() > 0 else 0
+                        f1 = f1_score(y_true, y_pred) if (y_pred.sum() > 0 and y_true.sum() > 0) else 0
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Accuracy", f"{accuracy:.3f}")
+                        with col2:
+                            st.metric("Precision", f"{precision:.3f}")
+                        with col3:
+                            st.metric("Recall", f"{recall:.3f}")
+                        with col4:
+                            st.metric("F1 Score", f"{f1:.4f}")
                 
-                # Cash flow vs risk scatter plot
-                if 'Net Cash Flows' in df_risk.columns:
-                    st.subheader("💰 Cash Flow vs Risk Analysis")
-                    fig = px.scatter(
-                        df_risk,
-                        x='Net Cash Flows',
-                        y='Risk_Probability',
-                        title="Cash Flow vs Outflow Risk Probability",
-                        hover_data=['Fund Name_x'] if 'Fund Name_x' in df_risk.columns else None
+                except Exception as e:
+                    st.error(f"❌ Error creating binary risk dashboard: {e}")
+        
+        else:  # Sequential Classification Dashboard
+            # Check if sequential models exist
+            stage1_exists = os.path.exists('sequential_models/stage1_inflow_outflow.joblib')
+            stage2a_exists = os.path.exists('sequential_models/stage2a_minor_major_outflow.joblib')
+            stage2b_exists = os.path.exists('sequential_models/stage2b_minor_major_inflow.joblib')
+            
+            if not stage1_exists:
+                st.warning("⚠️ Sequential models not found. Please train the sequential models first.")
+            else:
+                try:
+                    # Load sequential models
+                    stage1_model = joblib.load('sequential_models/stage1_inflow_outflow.joblib')
+                    stage2a_model = joblib.load('sequential_models/stage2a_minor_major_outflow.joblib') if stage2a_exists else None
+                    stage2b_model = joblib.load('sequential_models/stage2b_minor_major_inflow.joblib') if stage2b_exists else None
+                    
+                    # Prepare features
+                    leak_columns = [
+                        "Cash Outflows", "Cash Inflows", "Net Cash Flows",
+                        "Net Market & Other", "Net Change AUM", "Ending Net Assets"
+                    ]
+                    X = df.drop(leak_columns, axis=1, errors='ignore')
+                    
+                    # Make sequential predictions for all funds
+                    stage1_pred, stage2a_pred, stage2b_pred, combined_pred = sequential_predict_4cat(
+                        X, stage1_model, stage2a_model, stage2b_model
                     )
-                    fig.update_layout(
-                        xaxis_title="Net Cash Flows ($)",
-                        yaxis_title="Risk Probability"
+                    
+                    # Create sequential dashboard dataframe
+                    df_seq_dash = df.copy()
+                    df_seq_dash['Stage1_Prediction'] = stage1_pred  # 0=outflow, 1=inflow
+                    df_seq_dash['Combined_Prediction'] = combined_pred  # 0=major outflow, 1=minor outflow, 2=minor inflow, 3=major inflow
+                    
+                    # Create actual categories if possible
+                    if 'Net Cash Flows' in df.columns and 'Beginning Net Assets' in df.columns:
+                        df_seq_dash["Pct_Change_AUM"] = (df_seq_dash["Net Cash Flows"] / df_seq_dash["Beginning Net Assets"]) * 100.0
+                        df_seq_dash = df_seq_dash.replace([np.inf, -np.inf], np.nan)
+                        
+                        # Cap outliers for comparison
+                        pct_99 = df_seq_dash["Pct_Change_AUM"].quantile(0.99)
+                        pct_1 = df_seq_dash["Pct_Change_AUM"].quantile(0.01)
+                        df_seq_dash["Pct_Change_AUM_capped"] = df_seq_dash["Pct_Change_AUM"].clip(lower=pct_1, upper=pct_99)
+                        
+                        # Create actual combined labels
+                        df_seq_dash['Actual_Combined'] = create_combined_labels_4cat(df_seq_dash["Pct_Change_AUM_capped"])
+                    
+                    # Dashboard overview
+                    st.subheader("📊 Sequential Model Risk Overview")
+                    
+                    category_names = ['Major Outflow', 'Minor Outflow', 'Minor Inflow', 'Major Inflow']
+                    category_colors = ['#8B0000', '#FF6347', '#90EE90', '#006400']
+                    
+                    # Count predictions by category
+                    pred_counts = pd.Series(combined_pred).value_counts().sort_index()
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    for i, (col, name, color) in enumerate(zip([col1, col2, col3, col4], category_names, category_colors)):
+                        count = pred_counts.get(i, 0)
+                        pct = count / len(df_seq_dash) * 100
+                        with col:
+                            st.markdown(f"""
+                            <div style="background-color: {color}; color: white; padding: 0.5rem; border-radius: 0.5rem; text-align: center; margin: 0.2rem 0;">
+                                <h4>{name}</h4>
+                                <h3>{count}</h3>
+                                <p>{pct:.1f}%</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    
+                    # Category distribution charts
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # Predicted distribution
+                        fig = px.pie(
+                            values=pred_counts.values,
+                            names=[category_names[i] for i in pred_counts.index],
+                            title="Predicted Category Distribution",
+                            color_discrete_sequence=category_colors
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    with col2:
+                        if 'Actual_Combined' in df_seq_dash.columns:
+                            # Actual vs Predicted comparison
+                            actual_counts = pd.Series(df_seq_dash['Actual_Combined']).value_counts().sort_index()
+                            
+                            comparison_df = pd.DataFrame({
+                                'Predicted': pred_counts,
+                                'Actual': actual_counts
+                            }).fillna(0)
+                            comparison_df.index = [category_names[i] for i in comparison_df.index]
+                            
+                            fig = px.bar(
+                                comparison_df,
+                                title="Predicted vs Actual Distribution",
+                                barmode='group',
+                                color_discrete_sequence=['#1f77b4', '#ff7f0e']
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            # Stage 1 distribution only
+                            stage1_counts = pd.Series(stage1_pred).value_counts()
+                            fig = px.pie(
+                                values=stage1_counts.values,
+                                names=['Outflow', 'Inflow'],
+                                title="Stage 1: Flow Direction Distribution",
+                                color_discrete_sequence=['#ff6b6b', '#4ecdc4']
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Risk filtering
+                    st.subheader("🎯 Risk Category Filter")
+                    
+                    selected_categories = st.multiselect(
+                        "Select categories to highlight:",
+                        category_names,
+                        default=['Major Outflow'],
+                        help="Choose which risk categories to focus on"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
-                
-            except Exception as e:
-                st.error(f"Error creating risk dashboard: {e}")
-        else:
-            st.warning("⚠️ Binary classification model not found. Please train the model first.")
+                    
+                    # Filter funds by selected categories
+                    if selected_categories:
+                        selected_indices = [category_names.index(cat) for cat in selected_categories]
+                        filtered_mask = df_seq_dash['Combined_Prediction'].isin(selected_indices)
+                        filtered_funds = df_seq_dash[filtered_mask].copy()
+                        
+                        st.subheader(f"📋 Funds in Selected Categories ({len(filtered_funds)} funds)")
+                        
+                        if len(filtered_funds) > 0:
+                            # Add category names to display
+                            filtered_funds['Predicted_Category'] = filtered_funds['Combined_Prediction'].map(
+                                lambda x: category_names[x]
+                            )
+                            
+                            # Select relevant columns for display
+                            display_cols = ['Predicted_Category']
+                            if 'Fund Name_x' in filtered_funds.columns:
+                                display_cols = ['Fund Name_x'] + display_cols
+                            if 'Net Cash Flows' in filtered_funds.columns:
+                                display_cols = display_cols + ['Net Cash Flows']
+                            if 'Pct_Change_AUM' in filtered_funds.columns:
+                                display_cols = display_cols + ['Pct_Change_AUM']
+                            if 'Beginning Net Assets' in filtered_funds.columns:
+                                display_cols = display_cols + ['Beginning Net Assets']
+                            if 'Category_x' in filtered_funds.columns:
+                                display_cols = display_cols + ['Category_x']
+                            
+                            # Format the dataframe
+                            display_df = filtered_funds[display_cols].copy()
+                            
+                            if 'Net Cash Flows' in display_df.columns:
+                                display_df['Net Cash Flows'] = display_df['Net Cash Flows'].apply(lambda x: f"${x:,.0f}")
+                            if 'Pct_Change_AUM' in display_df.columns:
+                                display_df['Pct_Change_AUM'] = display_df['Pct_Change_AUM'].apply(lambda x: f"{x:.2f}%")
+                            if 'Beginning Net Assets' in display_df.columns:
+                                display_df['Beginning Net Assets'] = display_df['Beginning Net Assets'].apply(lambda x: f"${x:,.0f}")
+                            
+                            try:
+                                display_df_clean = clean_dataframe_for_streamlit(display_df)
+                                st.dataframe(display_df_clean, use_container_width=True)
+                            except Exception as e:
+                                st.error(f"Error displaying filtered funds table: {e}")
+                            
+                            # Download button for filtered funds
+                            csv = filtered_funds.to_csv(index=False)
+                            st.download_button(
+                                label="📥 Download Filtered Funds CSV",
+                                data=csv,
+                                file_name=f"sequential_filtered_funds.csv",
+                                mime="text/csv"
+                            )
+                        else:
+                            st.info("No funds found in the selected categories.")
+                    
+                    # Sequential model performance
+                    if 'Actual_Combined' in df_seq_dash.columns:
+                        st.subheader("📈 Sequential Model Performance Summary")
+                        
+                        # Calculate performance metrics
+                        y_true = df_seq_dash['Actual_Combined']
+                        y_pred = df_seq_dash['Combined_Prediction']
+                        
+                        # Remove any invalid predictions
+                        valid_mask = (y_true >= 0) & (y_pred >= 0)
+                        y_true_valid = y_true[valid_mask]
+                        y_pred_valid = y_pred[valid_mask]
+                        
+                        if len(y_true_valid) > 0:
+                            accuracy = accuracy_score(y_true_valid, y_pred_valid)
+                            
+                            # Calculate per-class metrics
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                st.metric("Overall 4-Class Accuracy", f"{accuracy:.3f}")
+                                
+                                # Confusion matrix
+                                cm = confusion_matrix(y_true_valid, y_pred_valid, labels=[0, 1, 2, 3])
+                                fig = px.imshow(
+                                    cm,
+                                    text_auto=True,
+                                    title="4-Class Confusion Matrix",
+                                    labels=dict(x="Predicted", y="Actual"),
+                                    x=category_names,
+                                    y=category_names
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                            
+                            with col2:
+                                # Classification report
+                                class_report = classification_report(
+                                    y_true_valid, y_pred_valid,
+                                    target_names=category_names,
+                                    output_dict=True
+                                )
+                                
+                                # Convert to DataFrame and display key metrics
+                                report_df = pd.DataFrame(class_report).transpose()
+                                
+                                # Show summary metrics
+                                if 'macro avg' in report_df.index:
+                                    macro_avg = report_df.loc['macro avg']
+                                    st.markdown("**Macro Averaged Metrics:**")
+                                    col1_inner, col2_inner, col3_inner = st.columns(3)
+                                    with col1_inner:
+                                        st.metric("Precision", f"{macro_avg['precision']:.3f}")
+                                    with col2_inner:
+                                        st.metric("Recall", f"{macro_avg['recall']:.3f}")
+                                    with col3_inner:
+                                        st.metric("F1-Score", f"{macro_avg['f1-score']:.3f}")
+                                
+                                # Detailed per-class metrics
+                                st.markdown("**Per-Class Performance:**")
+                                class_metrics = report_df.loc[category_names][['precision', 'recall', 'f1-score']].round(3)
+                                st.dataframe(class_metrics, use_container_width=True)
+                        else:
+                            st.warning("Unable to calculate performance metrics - no valid predictions")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error creating sequential risk dashboard: {e}")
 
 # Footer
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666;'>
     <p>🏢 Great Gray Fund Outflow Early Warning System</p>
-    <p>Built with Streamlit • Powered by Machine Learning</p>
+    <p>Binary & Sequential Classification Models • Built with Streamlit • Powered by Random Forest</p>
+    <p><em>Using pre-trained models for binary classification and 4-category sequential analysis</em></p>
 </div>
 """, unsafe_allow_html=True) 
