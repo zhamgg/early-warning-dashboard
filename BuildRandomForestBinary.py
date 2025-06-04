@@ -53,12 +53,15 @@ print("\nAvailable columns in the dataset:")
 for i, col in enumerate(df.columns):
     print(f"{i+1}. {col}")
 
-# Create target variable: 1 if Net Cash Flows < -1,000,000, else 0
+# Create target variable: 1 if Net Cash Flows < -5% of Ending Net Assets, else 0
 try:
-    df['target'] = (df['Net Cash Flows'] < -1000000).astype(int)
+    # Handle cases where Ending Net Assets might be zero or negative
+    df['target'] = ((df['Net Cash Flows'] < -0.05 * df['Ending Net Assets'].abs()) & 
+                    (df['Ending Net Assets'].abs() > 0)).astype(int)
     print(f"Target distribution: {df['target'].value_counts()}")
-except KeyError:
-    print("Error: 'Net Cash Flows' column not found in the dataset.")
+    print(f"Using 5% of Ending Net Assets as outflow threshold")
+except KeyError as e:
+    print(f"Error: Required column not found in the dataset: {e}")
     print(f"Available columns: {df.columns.tolist()}")
     exit(1)
 
